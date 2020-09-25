@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+
+import socket
+import json
+import signal
+import sys
+import time
+import os
+import fcntl
+import errno
+import stat
+
+RECV_CHUNK = 1024
+CLIENT_ID = 1
+ADDR = "/tmp/mpvsocket"
+LOCK = "/tmp/mpvinfod.lock"
+RETRY_DELAY = 10
+
+def run_once(command):
+    with open(LOCK, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            command()
+        except IOError as e:
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                print("Another instance of mpvinfod is already running",
+                      file = sys.stderr)
+            else:
+                waybar_output("title")
+            sys.exit(1)
+        except:
+            waybar_output("title")
+
+
+def signal_handler(sig, frame):
+    print('')
+    os.remove(ADDR)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# def wait_connect():
+#     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+#     connected = False
+#     while not connected:
+#         try:
+#             sock.connect(ADDR)
+#             connected = True
+#         except:
+#             time.sleep(RETRY_DELAY)
+#     return sock
+
+def wait_connect():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connected = False
+    while not connected:
+        try:
+            sock.connect(ADDR)
+            connected = True
+        except:
+            waybar_empty()
+            sys.exit(0)
+    return sock
+
+def observe(sock, prop):
+    str = f'{{ "command": ["observe_property", {CLIENT_ID}, "{prop}"] }}\n'
+    sock.sendall(str.encode("UTF-8"))
+
+def get_jsons(str):
+    return map(json.loads, str.splitlines())
+
+def waybar_output(title):
+    print(f'{{ "text": "{title}", "alt": "mpv", "class": "custom-mpv" }}',
+          flush = True)
+
+def waybar_empty():
+    waybar_output(" ")
+
+def bruh():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(ADDR)
+    except:
+        waybar_empty()
+        sys.exit(0)
+    observe(sock, "media-title")
+    while True:
+        str = sock.recv(RECV_CHUNK)
+        if not str: # Connection closed
+            sock.close()
+            # Explicitly delete the socket, otherwise reconnecting the
+            # socket works despite mpv having closed the connection,
+            # causing subsequent socket functions to fail
+            if os.path.exists(ADDR): os.remove(ADDR)
+            waybar_output("none")
+            sys.exit(0)
+        else:
+            data_jsons = filter(lambda j: 'data' in j,
+                                get_jsons(str.decode("UTF-8")))
+            for d in data_jsons: waybar_output(d['data'])
+
+# run_once(bruh)
+bruh()
