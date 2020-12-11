@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import socket
 import json
 import signal
@@ -43,28 +42,10 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-def wait_connect():
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connected = False
-    while not connected:
-        try:
-            sock.connect(ADDR)
-            connected = True
-        except Exception:
-            waybar_empty()
-            sys.exit(0)
-    return sock
-
-
 def observe(sock, prop):
     str = json.dumps({
-        'command': ['observe_property_string', CLIENT_ID, prop]
+        'command': ['observe_property', CLIENT_ID, prop]
     }) + '\n'
-    sock.sendall(str.encode('UTF-8'))
-
-
-def query(sock, prop):
-    str = json.dumps({'command': ['get_property_string', prop]}) + '\n'
     sock.sendall(str.encode('UTF-8'))
 
 
@@ -72,8 +53,8 @@ def get_jsons(str):
     return list(map(json.loads, str.splitlines()))
 
 
-def waybar_output(title):
-    print(json.dumps({'text': title, 'alt': 'mpv', 'class': 'custom-mpv'}),
+def waybar_output(str):
+    print(json.dumps({'text': str, 'alt': 'mpv', 'class': 'custom-mpv'}),
           flush=True)
 
 
@@ -81,7 +62,7 @@ def waybar_empty():
     waybar_output('n/a')
 
 
-def get_newest_event(json_list, event):
+def get_newest_data(json_list, event):
     events = [
         j for j in json_list
         if list(map(j.get, ['event', 'id', 'name'])) ==
@@ -90,36 +71,95 @@ def get_newest_event(json_list, event):
     if not events:
         return None
     else:
-        return events[-1].get('data')
+        # Use empty string to differentiate between 'no events found' and
+        # 'newest data is null'.
+        return events[-1].get('data') or ''
 
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-
-    print('Waiting for mpv connection...')
+def wait_connect(sock):
+    # print('Waiting for mpv server...')
     while True:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(ADDR)
             break
         except ConnectionError:
             time.sleep(5)
 
-    observe(sock, 'media-title')
-    observe(sock, 'metadata/by-key/album')
 
-    title = None
-    album = None
+def format_properties():
+    """Convert the property dict to a string suitable for output."""
+    title = property_dict['media-title']
+    if not title:
+        return None
+    album = property_dict['metadata/by-key/album']
+    album_str = f' | {album}' if album else ''
+    volume = property_dict['volume']
+    volume_str = f'({str(int(volume))}%)' if volume else ''
+    repeat = property_dict['loop-file']
+    repeat_str = ' ↻ ' if repeat else ' '
+
+    return f'{volume_str}{repeat_str}{title}{album_str}'
+
+
+def empty_or_default(s, default):
+    """Use 'or' without using the empty string as a false value."""
+    return '' if s == '' else s or default
+
+
+def new_dict(json_list):
+    """Update the property dict (if newer values are available)."""
+    return {
+        k: empty_or_default(get_newest_data(json_list, k), v)
+        for k, v in property_dict.items()
+    }
+
+
+def request_observers():
+    """Send observe requests to mpv."""
+    for event in property_dict.keys():
+        observe(sock, event)
+
+
+def end_session(sock):
+    # sock.shutdown(socket.SHUT_RDWR)
+    # sock.close()
+    waybar_empty()
+    time.sleep(2)  # HACK TO ENSURE IT IS CLOSED
+
+
+def run_observer(sock):
+    """Main program loop."""
+    global property_dict
+    reset_dict()
     while True:
-        contents = sock.recv(RECV_CHUNK)
-        if not contents:  # Connection closed
-            waybar_empty()
-            sys.exit(0)
+        try:
+            contents = sock.recv(RECV_CHUNK)
+        except ConnectionResetError:
+            end_session(sock)
+            return
+        if not contents:  # Connection closed.
+            end_session(sock)
+            return
         json_list = get_jsons(contents.decode('UTF-8'))
-        newest_title = get_newest_event(json_list, 'media-title')
-        newest_album = get_newest_event(json_list, 'metadata/by-key/album')
-        if (newest_title or title) and (newest_title or newest_album):
-            title = newest_title or title
-            album = newest_album or album
-            waybar_output(title +
-                          (" | " + album if album else ""))
+        # Update the dictionary and output only when necessary: that is, only
+        # when any of the observed properties have new values.
+        new = new_dict(json_list)
+        if new != property_dict:
+            property_dict = new
+            waybar_output(format_properties())
+
+
+def reset_dict():
+    """Set all property dict values to None."""
+    for k in property_dict.keys():
+        property_dict[k] = None
+
+
+# use inotify_simple
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        wait_connect(sock)
+        request_observers()
+        run_observer(sock)
