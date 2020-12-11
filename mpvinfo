@@ -5,16 +5,22 @@ import json
 import signal
 import sys
 import time
-import os
 import fcntl
 import errno
-import stat
 
-RECV_CHUNK = 1024
+RECV_CHUNK = 8192
 CLIENT_ID = 1
-ADDR = "/tmp/mpvsocket"
-LOCK = "/tmp/mpvinfod.lock"
+ADDR = '/tmp/mpvsocket'
+LOCK = '/tmp/mpvinfod.lock'
 RETRY_DELAY = 10
+
+property_dict = {
+    'media-title': None,
+    'metadata/by-key/album': None,
+    'volume': None,
+    'loop-file': None
+}
+
 
 def run_once(command):
     with open(LOCK, "w") as f:
@@ -23,32 +29,19 @@ def run_once(command):
             command()
         except IOError as e:
             if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                print("Another instance of mpvinfod is already running",
-                      file = sys.stderr)
+                print('Another instance of mpvinfod is already running',
+                      file=sys.stderr)
             else:
-                waybar_output("title")
+                waybar_empty()
             sys.exit(1)
-        except:
-            waybar_output("title")
+        except Exception:
+            waybar_empty()
 
 
 def signal_handler(sig, frame):
-    print('')
-    os.remove(ADDR)
+    waybar_empty()
     sys.exit(0)
 
-signal.signal(signal.SIGINT, signal_handler)
-
-# def wait_connect():
-#     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-#     connected = False
-#     while not connected:
-#         try:
-#             sock.connect(ADDR)
-#             connected = True
-#         except:
-#             time.sleep(RETRY_DELAY)
-#     return sock
 
 def wait_connect():
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -57,47 +50,76 @@ def wait_connect():
         try:
             sock.connect(ADDR)
             connected = True
-        except:
+        except Exception:
             waybar_empty()
             sys.exit(0)
     return sock
 
+
 def observe(sock, prop):
-    str = f'{{ "command": ["observe_property", {CLIENT_ID}, "{prop}"] }}\n'
-    sock.sendall(str.encode("UTF-8"))
+    str = json.dumps({
+        'command': ['observe_property_string', CLIENT_ID, prop]
+    }) + '\n'
+    sock.sendall(str.encode('UTF-8'))
+
+
+def query(sock, prop):
+    str = json.dumps({'command': ['get_property_string', prop]}) + '\n'
+    sock.sendall(str.encode('UTF-8'))
+
 
 def get_jsons(str):
-    return map(json.loads, str.splitlines())
+    return list(map(json.loads, str.splitlines()))
+
 
 def waybar_output(title):
-    print(f'{{ "text": "{title}", "alt": "mpv", "class": "custom-mpv" }}',
-          flush = True)
+    print(json.dumps({'text': title, 'alt': 'mpv', 'class': 'custom-mpv'}),
+          flush=True)
+
 
 def waybar_empty():
-    waybar_output(" ")
+    waybar_output('n/a')
 
-def bruh():
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        sock.connect(ADDR)
-    except:
-        waybar_empty()
-        sys.exit(0)
-    observe(sock, "media-title")
+
+def get_newest_event(json_list, event):
+    events = [
+        j for j in json_list
+        if list(map(j.get, ['event', 'id', 'name'])) ==
+        ['property-change', CLIENT_ID, event]
+    ]
+    if not events:
+        return None
+    else:
+        return events[-1].get('data')
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+
+    print('Waiting for mpv connection...')
     while True:
-        str = sock.recv(RECV_CHUNK)
-        if not str: # Connection closed
-            sock.close()
-            # Explicitly delete the socket, otherwise reconnecting the
-            # socket works despite mpv having closed the connection,
-            # causing subsequent socket functions to fail
-            if os.path.exists(ADDR): os.remove(ADDR)
-            waybar_output("none")
-            sys.exit(0)
-        else:
-            data_jsons = filter(lambda j: 'data' in j,
-                                get_jsons(str.decode("UTF-8")))
-            for d in data_jsons: waybar_output(d['data'])
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(ADDR)
+            break
+        except ConnectionError:
+            time.sleep(5)
 
-# run_once(bruh)
-bruh()
+    observe(sock, 'media-title')
+    observe(sock, 'metadata/by-key/album')
+
+    title = None
+    album = None
+    while True:
+        contents = sock.recv(RECV_CHUNK)
+        if not contents:  # Connection closed
+            waybar_empty()
+            sys.exit(0)
+        json_list = get_jsons(contents.decode('UTF-8'))
+        newest_title = get_newest_event(json_list, 'media-title')
+        newest_album = get_newest_event(json_list, 'metadata/by-key/album')
+        if (newest_title or title) and (newest_title or newest_album):
+            title = newest_title or title
+            album = newest_album or album
+            waybar_output(title +
+                          (" | " + album if album else ""))
