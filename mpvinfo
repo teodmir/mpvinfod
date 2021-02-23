@@ -6,12 +6,16 @@ import sys
 import time
 import fcntl
 import errno
+import os
+import pathlib
+from inotify_simple import INotify, flags
 
-RECV_CHUNK = 8192
-CLIENT_ID = 1
-ADDR = '/tmp/mpvsocket'
+# TODO replace current instance when running to avoid zombies
+
+RECV_CHUNK = 8192  # Size of byte chunks to read from the socket.
+CLIENT_ID = 1  # Client ID to be used in mpv communication.
+ADDR = '/tmp/mpvsocket'  # Location of the socket.
 LOCK = '/tmp/mpvinfod.lock'
-RETRY_DELAY = 10
 
 property_dict = {
     'media-title': None,
@@ -21,23 +25,24 @@ property_dict = {
 }
 
 
-def run_once(command):
-    with open(LOCK, "w") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            command()
-        except IOError as e:
-            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                print('Another instance of mpvinfod is already running',
-                      file=sys.stderr)
-            else:
-                waybar_empty()
-            sys.exit(1)
-        except Exception:
-            waybar_empty()
+# def run_once(command):
+#     with open(LOCK, "w") as f:
+#         try:
+#             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+#             command()
+#         except IOError as e:
+#             if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+#                 print('Another instance of mpvinfod is already running',
+#                       file=sys.stderr)
+#             else:
+#                 waybar_empty()
+#             sys.exit(1)
+#         except Exception:
+#             waybar_empty()
 
 
 def signal_handler(sig, frame):
+    """Empty the bar before exiting."""
     waybar_empty()
     sys.exit(0)
 
@@ -76,14 +81,26 @@ def get_newest_data(json_list, event):
         return events[-1].get('data') or ''
 
 
-def wait_connect(sock):
-    # print('Waiting for mpv server...')
+def wait_connect(inotify, sockname):
+    """Wait for the mpv server to start. This is done by using inotify to
+passively listen for changes to the socket file and reconnecting
+whenever a change occurs."""
     while True:
         try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(ADDR)
-            break
-        except ConnectionError:
-            time.sleep(5)
+            return sock
+        except ConnectionError as e:
+            print(e)
+            # Socket unavailable; wait for changes to the address
+            found = False
+            while not found:
+                for event in inotify.read():
+                    print(event.name)
+                    if event.name == sockname:
+                        found = True
+            # Hack; sometimes connection refused otherwise (why?)
+            time.sleep(0.1)
 
 
 def format_properties():
@@ -121,10 +138,11 @@ def request_observers():
 
 
 def end_session(sock):
-    # sock.shutdown(socket.SHUT_RDWR)
-    # sock.close()
     waybar_empty()
-    time.sleep(2)  # HACK TO ENSURE IT IS CLOSED
+    # For some reason, connect() will reuse the old socket unless we wait a bit
+    # (TIME_WAIT state?), resulting in a broken pipe error when sending the
+    # data. This hack ensures that a fresh socket is used.
+    time.sleep(0.2)
 
 
 def run_observer(sock):
@@ -140,7 +158,7 @@ def run_observer(sock):
         if not contents:  # Connection closed.
             end_session(sock)
             return
-        json_list = get_jsons(contents.decode('UTF-8'))
+        json_list = get_jsons(contents.decode('UTF-8', 'ignore'))
         # Update the dictionary and output only when necessary: that is, only
         # when any of the observed properties have new values.
         new = new_dict(json_list)
@@ -155,11 +173,17 @@ def reset_dict():
         property_dict[k] = None
 
 
-# use inotify_simple
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
+    waybar_empty()
+    inotify = INotify()
+    watch_flags = flags.CREATE
+    watch_dir = pathlib.Path(ADDR).parent
+    watch_file = pathlib.Path(ADDR).stem
+    wd = inotify.add_watch(pathlib.Path(ADDR).parent, watch_flags)
     while True:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        wait_connect(sock)
-        request_observers()
-        run_observer(sock)
+        # Using garbage collection to close the socket instead of an explicit
+        # close() call.
+        with wait_connect(inotify, watch_file) as sock:
+            request_observers()
+            run_observer(sock)
