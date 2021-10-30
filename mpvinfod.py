@@ -4,19 +4,16 @@ import json
 import signal
 import sys
 import time
-import fcntl
-import errno
-import os
 import pathlib
 from inotify_simple import INotify, flags
-
-# TODO replace current instance when running to avoid zombies
 
 RECV_CHUNK = 8192  # Size of byte chunks to read from the socket.
 CLIENT_ID = 1  # Client ID to be used in mpv communication.
 ADDR = '/tmp/mpvsocket'  # Location of the socket.
-LOCK = '/tmp/mpvinfod.lock'
+EMPTYSTR = ""  # Placeholder text to use when not active
+MAXLEN = 100  # Maximum length of the output string
 
+# Make this non-global
 property_dict = {
     'media-title': None,
     'metadata/by-key/album': None,
@@ -25,25 +22,9 @@ property_dict = {
 }
 
 
-# def run_once(command):
-#     with open(LOCK, "w") as f:
-#         try:
-#             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-#             command()
-#         except IOError as e:
-#             if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-#                 print('Another instance of mpvinfod is already running',
-#                       file=sys.stderr)
-#             else:
-#                 waybar_empty()
-#             sys.exit(1)
-#         except Exception:
-#             waybar_empty()
-
-
 def signal_handler(sig, frame):
     """Empty the bar before exiting."""
-    waybar_empty()
+    def_empty()
     sys.exit(0)
 
 
@@ -58,13 +39,12 @@ def get_jsons(str):
     return list(map(json.loads, str.splitlines()))
 
 
-def waybar_output(str):
-    print(json.dumps({'text': str, 'alt': 'mpv', 'class': 'custom-mpv'}),
-          flush=True)
+def def_output(str):
+    print(str, flush=True)
 
 
-def waybar_empty():
-    waybar_output('n/a')
+def def_empty():
+    def_output(EMPTYSTR)
 
 
 def get_newest_data(json_list, event):
@@ -90,13 +70,11 @@ whenever a change occurs."""
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(ADDR)
             return sock
-        except ConnectionError as e:
-            print(e)
+        except ConnectionError:
             # Socket unavailable; wait for changes to the address
             found = False
             while not found:
                 for event in inotify.read():
-                    print(event.name)
                     if event.name == sockname:
                         found = True
             # Hack; sometimes connection refused otherwise (why?)
@@ -113,9 +91,10 @@ def format_properties():
     volume = property_dict['volume']
     volume_str = f'({str(int(volume))}%)' if volume else ''
     repeat = property_dict['loop-file']
-    repeat_str = ' ↻ ' if repeat else ' '
-
-    return f'{volume_str}{repeat_str}{title}{album_str}'
+    repeat_str = ' (r) ' if repeat else ' '
+    full = f'{volume_str}{repeat_str}{title}{album_str}'
+    output = full if len(full) <= MAXLEN else full[0:MAXLEN] + "..."
+    return output
 
 
 def empty_or_default(s, default):
@@ -131,18 +110,18 @@ def new_dict(json_list):
     }
 
 
-def request_observers():
+def request_observers(sock):
     """Send observe requests to mpv."""
     for event in property_dict.keys():
         observe(sock, event)
 
 
 def end_session(sock):
-    waybar_empty()
+    def_empty()
     # For some reason, connect() will reuse the old socket unless we wait a bit
     # (TIME_WAIT state?), resulting in a broken pipe error when sending the
     # data. This hack ensures that a fresh socket is used.
-    time.sleep(0.2)
+    time.sleep(0.1)
 
 
 def run_observer(sock):
@@ -164,7 +143,7 @@ def run_observer(sock):
         new = new_dict(json_list)
         if new != property_dict:
             property_dict = new
-            waybar_output(format_properties())
+            def_output(format_properties())
 
 
 def reset_dict():
@@ -173,17 +152,21 @@ def reset_dict():
         property_dict[k] = None
 
 
-if __name__ == "__main__":
+def run():
     signal.signal(signal.SIGINT, signal_handler)
-    waybar_empty()
+    def_empty()
     inotify = INotify()
     watch_flags = flags.CREATE
     watch_dir = pathlib.Path(ADDR).parent
     watch_file = pathlib.Path(ADDR).stem
-    wd = inotify.add_watch(pathlib.Path(ADDR).parent, watch_flags)
+    inotify.add_watch(watch_dir, watch_flags)
     while True:
         # Using garbage collection to close the socket instead of an explicit
         # close() call.
         with wait_connect(inotify, watch_file) as sock:
-            request_observers()
+            request_observers(sock)
             run_observer(sock)
+
+
+if __name__ == "__main__":
+    run()
