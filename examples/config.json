@@ -1,0 +1,37 @@
+{
+    "format": "{pause}{loop-file}{mute}{volume}{media-title}{metadata/by-key/album}",
+    "custom": {
+        "pause": {
+            "format": "{prop} ",
+            "replace": {
+                "yes": "(paused)",
+                "no": ""
+            }
+        },
+        "mute": {
+            "format": "{prop} ",
+            "replace": {
+                "yes": "(muted)",
+                "no": ""
+            }
+        },
+        "loop-file": {
+            "format": "{prop} ",
+            "replace": {
+                "inf": "(loop)",
+                "no": ""
+            }
+        },
+        "volume": {
+            "format": "({prop}%) ",
+            "as_int": true
+        },
+        "media-title": {
+            "max_length": 80
+        },
+        "metadata/by-key/album": {
+            "format": " | {prop}",
+            "max_length": 50
+        }
+    }
+}
